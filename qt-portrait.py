@@ -2,7 +2,7 @@ from argparse import ArgumentParser
 from PyQt6.QtGui import *
 from PyQt6.QtCore import *
 from PyQt6.QtWidgets import * 
-from PIL import ImageQt
+from PIL import ImageQt,Image
 import sys
 from time import sleep
 
@@ -10,7 +10,9 @@ import zmq
 import ipc_pb2
 #import ipc_pb2.IPC.Action as act
 import os
+import io
 import threading
+
 
 act= ipc_pb2.IPC.Action
 
@@ -55,7 +57,19 @@ def model_runner( ):
         raise Exception("BARF")
 
     socket.send(message(act.STARTED))
-    do_log("TEST LOG")
+    do_log("Starting Model Load")
+    from diffusers import StableDiffusionPipeline
+    import torch
+
+    do_log("Python Modules Loaded")
+
+    model_id = "CompVis/stable-diffusion-v1-4"
+    pipeline = StableDiffusionPipeline.from_pretrained(model_id,
+            torch_dtype=torch.float16)
+    do_log(f"Model {model_id} Loaded")
+
+    pipeline.to("cuda")
+    do_log(f"Model {model_id} put to cuda")
 
     working = True
     while working:
@@ -67,18 +81,28 @@ def model_runner( ):
         elif ipcm.action == act.STOP: 
             working = False
             do_log("BYEEEEEEEEE")
+        elif ipcm.action == act.IMAGE_REQUEST:
+            do_log(f"Receieved request for {ipcm.str_data}")
+            results = pipeline(ipcm.str_data) 
+            print(results)
+            image = results.images[0]
+            do_log(f"Image created. Sending.")
+            with io.BytesIO() as io_stream:
+                image.save(io_stream,format="PNG")
+                socket.send(message(act.IMAGE,blob=io_stream.getvalue())) 
 
 
 class ModelWorker(QObject):
     image_error = pyqtSignal(str)
     image_ready = pyqtSignal(object)
 
-    def __init__(self ):
+    def __init__(self,socket ):
         super().__init__()
 
         self.run_mutex = QMutex()
         self.finished = QWaitCondition()
         self.update_mutex =QMutex()
+        self.socket = socket
 
         # protect with update
         self.ready=False
@@ -89,14 +113,6 @@ class ModelWorker(QObject):
         self.ready =False
         self.update_mutex.unlock()
         print("Running Model")
-        from diffusers import StableDiffusionPipeline
-        import torch
-
-        model_id = "CompVis/stable-diffusion-v1-4"
-        self.pipeline = StableDiffusionPipeline.from_pretrained(model_id,
-                torch_dtype=torch.float16)
-
-        self.pipeline.to("cuda")
 
         #sleep(3)
         print("Done Model, Waiting.")
@@ -111,15 +127,15 @@ class ModelWorker(QObject):
         print(f"Request for Create: {input_str}")
         #sleep(5)
         #self.image_ready.emit(None)
-        prompt = input_str
+        self.socket.send(message(act.IMAGE_REQUEST,string=input_str)) 
+        msg = self.socket.recv()
+        ipcm = rmessage(msg)
 
-        try:
-            results = self.pipeline(prompt) 
-            print(results)
-            image = results.images[0]
-            self.image_ready.emit(image)
-        except Exception as e:
-            print(e)
+        if ipcm.action == act.IMAGE:
+        #self.image_ready.emit(Image.frombytes("RGBA",ipcm.blob_data,decoder_name="png"))
+            img = Image.open(io.BytesIO(ipcm.blob_data))
+            print(f"Ok, recevied image. {img}")
+            self.image_ready.emit(img) 
 
     @pyqtSlot()
     def on_exit(self):
@@ -130,11 +146,11 @@ class Window(QWidget):
     image_request = pyqtSignal(str)
     shutdown = pyqtSignal()
     start_background = pyqtSignal()
-    def __init__(self):
+    def __init__(self,socket):
         QWidget.__init__(self)
 
         self.bkgr = QThread()
-        self.worker = ModelWorker()
+        self.worker = ModelWorker(socket)
         self.worker.moveToThread(self.bkgr)
 
         self.working = False
@@ -181,10 +197,9 @@ class Window(QWidget):
         if image is None:
             return
         print(f"Ready! {type(image)} format is {image.format}")
-        pil2qt = ImageQt.ImageQt(image)
-        px = QPixmap.fromImage(pil2qt)
-        #img = QImage( image.tobytes("raw", "RGB"), image.size[0], image.size[1],
-        #        QImage.Format_RGB32)
+        px = ImageQt.toqpixmap(image)
+        #px = QPixmap.fromImage(pil2qt)
+        print(f"set {px}")
         self.image_area.setPixmap(px)
 
 #pipe_fds = os.pipe()
@@ -233,15 +248,10 @@ else:
     ipcm = rmessage(msg)
     if ipcm.action == act.PONG: 
         print("ok, alive.")
-        #socket.send(message(act.PING))
     else:
         raise Exception("IPC Init PING Fail")
-    socket.send(message(act.STOP))
-    #os.write(write_fd,X)
     sleep(4)
     log_run=False
-    lthread.join()
-    sys.exit(0)
 
     app = QApplication(sys.argv)
 
@@ -249,7 +259,10 @@ else:
     opts = get_args([ str(s) for s in unused_args ][1:])
 
     print(opts.default_text)
-    screen = Window()
+    screen = Window(socket)
     screen.show()
 
-    sys.exit(app.exec())
+    app.exec()
+    socket.send(message(act.STOP))
+    lthread.join()
+    sys.exit(0) 
