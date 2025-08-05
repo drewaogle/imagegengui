@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package imggen;
+
+message IPC {
+    enum Action {
+        PING = 0;
+        PONG = 1;
+        STARTED = 2;
+        STOP = 3;
+        IMAGE_REQUEST = 4;
+        IMAGE = 5;
+        LOG = 6;
+    }
+    Action action = 1;
+    string str_data = 2;
+    bytes blob_data = 3;
+}
+        
