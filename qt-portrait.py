@@ -6,6 +6,14 @@ from PIL import ImageQt
 import sys
 from time import sleep
 
+import zmq
+import ipc_pb2
+#import ipc_pb2.IPC.Action as act
+import os
+import threading
+
+act= ipc_pb2.IPC.Action
+
 print(sys.argv)
 def get_args( our_args):
     print(our_args)
@@ -15,6 +23,50 @@ def get_args( our_args):
     opts=parser.parse_args( our_args)
     return opts
 
+def message( action, string=None, blob=None ):
+    out = ipc_pb2.IPC()
+    out.action = action
+    if string is not None:
+        out.str_data = string
+    if blob is not None:
+        out.blob_data = blob
+    return out.SerializeToString()
+
+def rmessage( blob ):
+    out = ipc_pb2.IPC()
+    out.ParseFromString(blob)
+    return out
+
+
+def model_runner( ):
+    ctx = zmq.Context()
+    socket = ctx.socket(zmq.REP)
+    socket.bind("tcp://localhost:5788")
+
+    lsocket = ctx.socket(zmq.PUB)
+    lsocket.bind("tcp://localhost:5789")
+    msg = socket.recv()
+    ipcm = rmessage(msg)
+
+    def do_log(string):
+        lsocket.send_multipart([b'info',string.encode('utf-8')])
+    if ipcm.action != act.STARTED:
+        do_log("BARF")
+        raise Exception("BARF")
+
+    socket.send(message(act.STARTED))
+    do_log("TEST LOG")
+
+    working = True
+    while working:
+        msg = socket.recv()
+        ipcm = rmessage(msg)
+        if ipcm.action == act.PING: 
+            socket.send(message(act.PONG))
+            do_log("PONG")
+        elif ipcm.action == act.STOP: 
+            working = False
+            do_log("BYEEEEEEEEE")
 
 
 class ModelWorker(QObject):
@@ -135,14 +187,69 @@ class Window(QWidget):
         #        QImage.Format_RGB32)
         self.image_area.setPixmap(px)
 
+#pipe_fds = os.pipe()
+pid = os.fork()
 
-app = QApplication(sys.argv)
+log_run = True
+def log_recv( ctz ):
+    zsocket = ctx.socket(zmq.SUB)
+    zsocket.connect("tcp://localhost:5789")
+    #lsocket.setsockopt(zmq.SUBSCRIBE, 4)
+    zsocket.subscribe("")
+    poller = zmq.Poller()
+    poller.register(zsocket,zmq.POLLIN)
+    print("log reciever on.")
+    while log_run:
+        socks = dict(poller.poll(1000))
+        if socks:
+            if socks.get(zsocket):
+                bmsg = zsocket.recv(zmq.NOBLOCK)
+                print(f"M {bmsg.decode('utf-8')}")
+            else:
+                print("Socks, but not zsocket?")
+        #else:
+        #   print("No data")
+    print("Done")
 
-unused_args = app.arguments()
-opts = get_args([ str(s) for s in unused_args ][1:])
 
-print(opts.default_text)
-screen = Window()
-screen.show()
+if pid == 0:
+    model_runner()
+else:
+    ctx = zmq.Context()
+    socket = ctx.socket(zmq.REQ)
+    socket.connect("tcp://localhost:5788")
+    socket.send(message(act.STARTED))
 
-sys.exit(app.exec())
+    lthread = threading.Thread(target=log_recv,args=(ctx,))
+    lthread.start()
+
+    msg = socket.recv()
+    ipcm = rmessage(msg)
+    if ipcm.action == act.STARTED: 
+        socket.send(message(act.PING))
+    else:
+        raise Exception("IPC Init Fail")
+    msg = socket.recv()
+    ipcm = rmessage(msg)
+    if ipcm.action == act.PONG: 
+        print("ok, alive.")
+        #socket.send(message(act.PING))
+    else:
+        raise Exception("IPC Init PING Fail")
+    socket.send(message(act.STOP))
+    #os.write(write_fd,X)
+    sleep(4)
+    log_run=False
+    lthread.join()
+    sys.exit(0)
+
+    app = QApplication(sys.argv)
+
+    unused_args = app.arguments()
+    opts = get_args([ str(s) for s in unused_args ][1:])
+
+    print(opts.default_text)
+    screen = Window()
+    screen.show()
+
+    sys.exit(app.exec())
