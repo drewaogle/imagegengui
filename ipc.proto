@@ -11,6 +11,8 @@ message IPC {
         IMAGE_REQUEST = 4;
         IMAGE = 5;
         LOG = 6;
+        LOAD = 7;
+        LOADED = 8;
     }
     Action action = 1;
     string str_data = 2;

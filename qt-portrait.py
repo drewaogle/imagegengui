@@ -12,15 +12,18 @@ import ipc_pb2
 import os
 import io
 import threading
+import pandas as pd
+from pathlib import Path
 
 
 act= ipc_pb2.IPC.Action
 
-print(sys.argv)
 def get_args( our_args):
-    print(our_args)
     parser = ArgumentParser()
     parser.add_argument('-t','--default-text',default="A cow eating grass")
+    parser.add_argument('-S','--source-csv',default=None,help="A csv for parameters to inject to prompt template") 
+    parser.add_argument('-O','--output-dir',default="./output",help="Where to output images")
+    parser.add_argument('-n','--output-name-format',default="{row_num}.png",help="How to name files") 
 
     opts=parser.parse_args( our_args)
     return opts
@@ -62,14 +65,7 @@ def model_runner( ):
     import torch
 
     do_log("Python Modules Loaded")
-
-    model_id = "CompVis/stable-diffusion-v1-4"
-    pipeline = StableDiffusionPipeline.from_pretrained(model_id,
-            torch_dtype=torch.float16)
-    do_log(f"Model {model_id} Loaded")
-
-    pipeline.to("cuda")
-    do_log(f"Model {model_id} put to cuda")
+    pipeline = None
 
     working = True
     while working:
@@ -78,6 +74,15 @@ def model_runner( ):
         if ipcm.action == act.PING: 
             socket.send(message(act.PONG))
             do_log("PONG")
+        elif ipcm.action == act.LOAD: 
+            model_id = "CompVis/stable-diffusion-v1-4"
+            pipeline = StableDiffusionPipeline.from_pretrained(model_id,
+                    torch_dtype=torch.float16)
+            do_log(f"Model {model_id} Loaded")
+
+            pipeline.to("cuda")
+            do_log(f"Model {model_id} put to cuda")
+            socket.send(message(act.LOADED))
         elif ipcm.action == act.STOP: 
             working = False
             do_log("BYEEEEEEEEE")
@@ -91,10 +96,15 @@ def model_runner( ):
                 image.save(io_stream,format="PNG")
                 socket.send(message(act.IMAGE,blob=io_stream.getvalue())) 
 
+    socket.close()
+    lsocket.close()
+    ctx.term()
+
 
 class ModelWorker(QObject):
     image_error = pyqtSignal(str)
     image_ready = pyqtSignal(object)
+    model_ready = pyqtSignal()
 
     def __init__(self,socket ):
         super().__init__()
@@ -108,31 +118,23 @@ class ModelWorker(QObject):
         self.ready=False
 
     @pyqtSlot()
-    def run(self):
-        self.update_mutex.lock()
-        self.ready =False
-        self.update_mutex.unlock()
-        print("Running Model")
-
-        #sleep(3)
-        print("Done Model, Waiting.")
-        #self.run_mutex.lock()
-        #self.finished.wait(self.run_mutex)
-        print("Done Wait")
-        
-        # init, then wait for term conidiont.
-
+    def initialize(self): 
+        socket.send(message(act.LOAD))
+        msg = socket.recv()
+        ipcm = rmessage(msg)
+        if ipcm.action == act.LOADED: 
+            self.model_ready.emit()
+        else:
+            raise Exception("IPC Init Fail")
     @pyqtSlot(str)
     def create(self,input_str):
         print(f"Request for Create: {input_str}")
-        #sleep(5)
-        #self.image_ready.emit(None)
+
         self.socket.send(message(act.IMAGE_REQUEST,string=input_str)) 
         msg = self.socket.recv()
         ipcm = rmessage(msg)
 
         if ipcm.action == act.IMAGE:
-        #self.image_ready.emit(Image.frombytes("RGBA",ipcm.blob_data,decoder_name="png"))
             img = Image.open(io.BytesIO(ipcm.blob_data))
             print(f"Ok, recevied image. {img}")
             self.image_ready.emit(img) 
@@ -146,8 +148,46 @@ class Window(QWidget):
     image_request = pyqtSignal(str)
     shutdown = pyqtSignal()
     start_background = pyqtSignal()
-    def __init__(self,socket):
+    def on_next(self):
+        print("on next")
+        if self.row_num < self.df.shape[1]:
+            self.row_num = self.row_num + 1
+        else:
+            print(f"At the end of the data {self.row_num } >= {self.df.shape[1]} ")
+    def on_save(self):
+        template_data = {}
+        if self.df is not None:
+            template_data.update( self.df.iloc[self.row_num].to_dict() )
+        template_data["row_num"] = self.row_num
+        print(f"map is {template_data}")
+        final_name = str(self.save_format).format_map( template_data )
+        print(f"on save = {final_name}")
+        self.image_area.pixmap().save( final_name )
+    def on_gen(self):
+        print("on gen")
+        self.start_background.emit()
+    def on_inject_create(self,prompt):
+        prompt = self.text.text()
+        template_data = {}
+        if self.df is not None:
+            template_data.update( self.df.iloc[self.row_num].to_dict() )
+        template_data["row_num"] = self.row_num
+        final_prompt = prompt.format_map( template_data )
+
+        self.image_request.emit(final_prompt)
+    def __init__(self,socket, save_format:Path, df=None):
         QWidget.__init__(self)
+
+        self.row_num = 1
+        self.df = df
+        self.save_format = save_format
+
+        self.next_item = QShortcut(QKeySequence("Ctrl+N"),self)
+        self.save = QShortcut(QKeySequence("Ctrl+S"),self)
+        self.gen = QShortcut(QKeySequence("Ctrl+G"),self)
+        self.next_item.activated.connect(self.on_next)
+        self.save.activated.connect(self.on_save)
+        self.gen.activated.connect(self.on_gen)
 
         self.bkgr = QThread()
         self.worker = ModelWorker(socket)
@@ -172,22 +212,20 @@ class Window(QWidget):
 
         self.setGeometry(500,500,500,500)
 
-        self.go.clicked.connect(self.on_generate)
+        self.go.clicked.connect(self.on_inject_create)
 
         # image requst from here to worker
         self.image_request.connect(self.worker.create)
         # image output from worker to here
         self.worker.image_ready.connect( self.on_image_ready )
         self.shutdown.connect(self.worker.on_exit)
-        self.start_background.connect(self.worker.run)
+        self.start_background.connect(self.worker.initialize)
         self.bkgr.start()
-        self.start_background.emit()
+        #self.start_background.emit()
 
 
-    def on_generate(self):
-        print("Gen Req"+ self.text.text())
-        self.working = True
-        self.image_request.emit(self.text.text())
+    def setPrompt(self,new_text):
+        self.text.setText(new_text)
 
     def closeEvent(self,event):
         print("Exiting")
@@ -225,6 +263,7 @@ def log_recv( ctz ):
         #else:
         #   print("No data")
     print("Done")
+    zsocket.close()
 
 
 if pid == 0:
@@ -250,19 +289,50 @@ else:
         print("ok, alive.")
     else:
         raise Exception("IPC Init PING Fail")
-    sleep(4)
+  #  sleep(4)
     log_run=False
 
     app = QApplication(sys.argv)
 
     unused_args = app.arguments()
+
+    # we have to parse all this now because we want Qt to be able to accept
+    # args, and we don't want the env for the model to have qt stuff activated.
     opts = get_args([ str(s) for s in unused_args ][1:])
 
-    print(opts.default_text)
-    screen = Window(socket)
-    screen.show()
+    bail = False
+    out_path = Path( opts.output_dir)
+    if out_path.exists():
+        if not out_path.is_dir():
+            bail = True
+            print(f"ERROR: output_dir {out_path} exists, and isn't a directory")
+    else:
+        try:
+            out_path.mkdir()
+        except:
+            bail = True
+            print(f"ERROR: output_dir {out_path} couldn't be created.") 
 
-    app.exec()
+    csv = None
+    if opts.source_csv is not None:
+        try:
+            csv = pd.read_csv( opts.source_csv )
+        except:
+            bail = True
+            print(f"ERROR: couldn't read {opts.source_csv}")
+
+
+
+
+    if not bail:
+        print(opts.default_text)
+        screen = Window(socket,out_path / opts.output_name_format,df=csv)
+        screen.setPrompt(opts.default_text)
+        screen.show()
+
+        app.exec()
     socket.send(message(act.STOP))
+    socket.close()
     lthread.join()
+    ctx.term()
     sys.exit(0) 
