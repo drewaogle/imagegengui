@@ -158,7 +158,7 @@ class Window(QWidget):
         template_data = {}
         if self.df is not None:
             template_data.update( self.df.iloc[self.row_num].to_dict() )
-        template_data["row_num"] = self.row_num
+        template_data["row_num"] = self.row_num + 1
         print(f"map is {template_data}")
         final_name = str(self.save_format).format_map( template_data )
         print(f"on save = {final_name}")
@@ -171,14 +171,14 @@ class Window(QWidget):
         template_data = {}
         if self.df is not None:
             template_data.update( self.df.iloc[self.row_num].to_dict() )
-        template_data["row_num"] = self.row_num
+        template_data["row_num"] = self.row_num + 1
         final_prompt = prompt.format_map( template_data )
 
         self.image_request.emit(final_prompt)
     def __init__(self,socket, save_format:Path, df=None):
         QWidget.__init__(self)
 
-        self.row_num = 1
+        self.row_num = 0
         self.df = df
         self.save_format = save_format
 
